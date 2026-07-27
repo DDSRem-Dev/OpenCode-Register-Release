@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (for example, v0.0.6)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PyInstaller 无法交叉编译，每个 target 必须在对应架构的 runner 上构建。
+          # macOS Intel 的镜像标签随 GitHub 镜像轮换变化，升级前先核对当前可用标签。
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout source tag
+        env:
+          GITEA_HOST: ${{ secrets.GITEA_HOST }}
+          SOURCE_REF: ${{ inputs.version }}
+        run: |
+          git init .
+          git remote add origin "https://${GITEA_HOST}/DDSRem/OpenCode-Register.git"
+          git fetch --depth=1 origin "+refs/tags/${SOURCE_REF}:refs/tags/${SOURCE_REF}"
+          git checkout --detach "refs/tags/${SOURCE_REF}"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          uv sync --project backend --group dev --locked          
+
+      - name: Freeze backend sidecar
+        run: uv run --project backend python scripts/build_backend.py --target ${{ matrix.target }}
+
+      # 在进入 Tauri 打包前先证明冻结产物本身可用，避免把坏的 sidecar 装进安装包。
+      - name: Smoke test frozen backend
+        env:
+          OPENCODE_REGISTER_SANDBOX_DIR: ${{ github.workspace }}/.opencode-register-sandbox
+        run: |
+          binary="src-tauri/binaries/backend-${{ matrix.target }}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            binary="${binary}.exe"
+          fi
+          "${binary}" --host 127.0.0.1 --port 17891 &
+          backend_pid=$!
+          trap 'kill "${backend_pid}" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:17891/api/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "frozen backend did not become healthy" >&2
+          exit 1          
+
+      - name: Build desktop bundle
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      # 产物未签名也未公证：macOS 会被 Gatekeeper 拦截，Windows 可能触发 Defender 提示。
+      - name: Collect artifacts and checksums
+        run: |
+          mkdir -p release
+          bundle_root="src-tauri/target/${{ matrix.target }}/release/bundle"
+          while IFS= read -r artifact; do
+            filename="$(basename "${artifact}")"
+            stem="${filename%.*}"
+            extension="${filename##*.}"
+            cp "${artifact}" "release/${stem}-${{ matrix.target }}.${extension}"
+          done < <(find "${bundle_root}" -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \))
+          cd release
+          if [ -z "$(ls -A)" ]; then
+            echo "no distributable artifact was produced" >&2
+            exit 1
+          fi
+          checksum_file="SHA256SUMS-${{ matrix.target }}.txt"
+          for file in *; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${file}" >> "${checksum_file}"
+            else
+              shasum -a 256 "${file}" >> "${checksum_file}"
+            fi
+          done
+          cat "${checksum_file}"          
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: opencode-register-${{ matrix.target }}
+          path: release/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: opencode-register-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Create release and upload distributable files
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ inputs.version }}
+          name: OpenCode Register ${{ inputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ contains(inputs.version, '-') }}
+          fail_on_unmatched_files: true
+          files: release-artifacts/*
